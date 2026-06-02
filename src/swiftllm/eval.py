@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from swiftllm.dist import all_reduce_sum
+
 
 @torch.no_grad()
 def evaluate_bpb(
@@ -37,6 +39,9 @@ def evaluate_bpb(
         total_bytes += bytes_flat.sum()
 
     model.train()
+
+    total_nats = all_reduce_sum(total_nats)
+    total_bytes = all_reduce_sum(total_bytes)
 
     tb = int(total_bytes.item())
     if tb == 0:

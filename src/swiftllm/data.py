@@ -34,14 +34,24 @@ class ClimbMixShardManager:
 
 
 class TextIterator:
-    def __init__(self, paths: list[Path], text_column: str, seed: int) -> None:
+    def __init__(
+        self,
+        paths: list[Path],
+        text_column: str,
+        seed: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
         self.paths = paths
         self.text_column = text_column
         self.rng = random.Random(seed)
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
 
     def iter_texts(self) -> Iterator[str]:
         paths = self.paths[:]
         self.rng.shuffle(paths)
+        sample_idx = 0
         for path in paths:
             pf = pq.ParquetFile(path)
             row_group_ids = list(range(pf.num_row_groups))
@@ -52,7 +62,9 @@ class TextIterator:
                 self.rng.shuffle(texts)
                 for text in texts:
                     if text:
-                        yield text
+                        if (sample_idx % self.world_size) == self.rank:
+                            yield text
+                        sample_idx += 1
 
 
 class TokenStreamDataset:
@@ -142,22 +154,30 @@ class PackedTokenCacheIterator:
         seq_len: int,
         device: torch.device,
         seed: int,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.reader = TokenCacheReader(cache_path)
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.device = device
         self.rng = random.Random(seed)
-        self.pos = self.rng.randrange(0, max(1, self.reader.size - 1))
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        tokens_per_row = self.seq_len + 1
+        self.tokens_per_step = self.batch_size * tokens_per_row
+        base = self.rng.randrange(0, max(1, self.reader.size - 1))
+        self.pos = (base + self.rank * self.tokens_per_step) % self.reader.size
 
     def __iter__(self) -> "PackedTokenCacheIterator":
         return self
 
     def __next__(self) -> tuple[torch.Tensor, torch.Tensor]:
         tokens_per_row = self.seq_len + 1
-        needed = self.batch_size * tokens_per_row
+        needed = self.tokens_per_step
         flat = self.reader.get(self.pos, needed)
-        self.pos = (self.pos + needed) % self.reader.size
+        stride = needed * self.world_size
+        self.pos = (self.pos + stride) % self.reader.size
 
         t = torch.from_numpy(flat.astype(np.int64, copy=False)).view(self.batch_size, tokens_per_row)
         x = t[:, :-1].to(self.device, non_blocking=True)
@@ -215,28 +235,39 @@ class SFTBatchIterator:
         seq_len: int,
         device: torch.device,
         seed: int,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.dataset = dataset
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.device = device
         self.rng = random.Random(seed)
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
         self.indices = list(range(len(dataset.examples)))
+        self.rank_indices: list[int] = []
         self.pos = 0
         self._shuffle()
 
     def _shuffle(self) -> None:
         self.rng.shuffle(self.indices)
+        self.rank_indices = self.indices[self.rank :: self.world_size]
+        if not self.rank_indices:
+            raise ValueError(
+                f"Rank {self.rank} has no SFT samples. "
+                f"dataset_size={len(self.indices)} world_size={self.world_size}"
+            )
         self.pos = 0
 
     def __iter__(self) -> "SFTBatchIterator":
         return self
 
     def __next__(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.pos + self.batch_size > len(self.indices):
+        if self.pos + self.batch_size > len(self.rank_indices):
             self._shuffle()
 
-        batch_idx = self.indices[self.pos : self.pos + self.batch_size]
+        batch_idx = self.rank_indices[self.pos : self.pos + self.batch_size]
         self.pos += self.batch_size
 
         pad_id = self.dataset.tokenizer.get_pad_token_id()

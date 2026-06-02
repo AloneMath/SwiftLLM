@@ -34,6 +34,27 @@ The config uses:
 
 ## Full pipeline commands
 
+## Distributed launch (torchrun)
+
+Use this when `train.distributed: true` in your config (for example `.\configs\train_1p3b_h800_stage0.yaml`).
+
+### Multi-GPU pretrain (8 GPUs, single node)
+
+```powershell
+torchrun --standalone --nproc_per_node=8 -m scripts.train --config .\configs\train_1p3b_h800_stage0.yaml
+```
+
+### Multi-GPU SFT (8 GPUs, single node)
+
+```powershell
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft `
+  --config .\configs\train_1p3b_h800_stage0.yaml `
+  --train-jsonl .\data\sft_train.jsonl `
+  --val-jsonl .\data\sft_val.jsonl `
+  --resume-ckpt .\checkpoints\swiftllm_1p3b_h800_stage0\step_040000.pt `
+  --sft-steps 3000
+```
+
 ### 1) Train tokenizer
 
 ```powershell

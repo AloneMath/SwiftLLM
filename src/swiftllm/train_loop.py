@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import tiktoken
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from swiftllm.checkpoint import CheckpointState, restore_training_state, save_checkpoint
 from swiftllm.config import Config
@@ -19,6 +20,7 @@ from swiftllm.data import (
     count_parameters,
     format_params,
 )
+from swiftllm.dist import barrier, cleanup_distributed, init_distributed, is_main_process
 from swiftllm.eval import evaluate_bpb
 from swiftllm.metrics import RunLogger, ThroughputStats, estimate_elapsed_hours, target_progress_text
 from swiftllm.model import SwiftLLM
@@ -168,7 +170,7 @@ class CombinedOptimizer(torch.optim.Optimizer):
 
 def build_optimizer(
     cfg: Config,
-    model: SwiftLLM,
+    model: torch.nn.Module,
     device: torch.device,
 ) -> tuple[torch.optim.Optimizer, dict[str, int], str]:
     optimizer_name = cfg.train.optimizer.lower()
@@ -237,6 +239,8 @@ def build_iterators(
     cfg: Config,
     device: torch.device,
     tokenizer: SwiftTokenizer,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[PackedBatchIterator | PackedTokenCacheIterator, PackedBatchIterator | PackedTokenCacheIterator]:
     if cfg.data.token_cache_dir:
         cache_dir = Path(cfg.data.token_cache_dir)
@@ -249,6 +253,8 @@ def build_iterators(
                 seq_len=cfg.train.max_seq_len,
                 device=device,
                 seed=cfg.train.seed,
+                rank=rank,
+                world_size=world_size,
             )
             val_it = PackedTokenCacheIterator(
                 cache_path=val_cache,
@@ -256,6 +262,8 @@ def build_iterators(
                 seq_len=cfg.train.max_seq_len,
                 device=device,
                 seed=cfg.train.seed + 1,
+                rank=rank,
+                world_size=world_size,
             )
             print(f"Using token cache: {cache_dir}")
             return train_it, val_it
@@ -268,11 +276,15 @@ def build_iterators(
         paths=mgr.train_paths(),
         text_column=cfg.data.text_column,
         seed=cfg.train.seed,
+        rank=rank,
+        world_size=world_size,
     )
     val_text = TextIterator(
         paths=[mgr.val_path()],
         text_column=cfg.data.text_column,
         seed=cfg.train.seed + 1,
+        rank=rank,
+        world_size=world_size,
     )
 
     train_ds = TokenStreamDataset(train_text, tokenizer)
@@ -284,209 +296,262 @@ def build_iterators(
 
 
 def train(cfg: Config) -> None:
-    set_seed(cfg.train.seed)
-    device = resolve_device(cfg.train.device)
-    dtype = resolve_dtype(cfg.train.compute_dtype)
+    dist_enabled = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
 
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-        torch.cuda.reset_peak_memory_stats()
+    try:
+        dist_enabled, rank, world_size, local_rank = init_distributed(
+            enabled=cfg.train.distributed,
+            backend=cfg.train.dist_backend,
+            timeout_sec=cfg.train.dist_timeout_sec,
+        )
 
-    tokenizer = SwiftTokenizer.from_file(cfg.data.tokenizer_path)
-    cfg.model.vocab_size = tokenizer.get_vocab_size()
+        is_main = is_main_process()
 
-    model = SwiftLLM(cfg.model).to(device)
-    model.set_gradient_checkpointing(bool(cfg.train.gradient_checkpointing))
-    model.set_attention_backend(cfg.train.attention_backend)
-    n_params = count_parameters(model)
-    optimizer, _, optimizer_info = build_optimizer(cfg, model, device)
+        def main_print(msg: str) -> None:
+            if is_main:
+                print(msg)
 
-    step, best_val_bpb = restore_training_state(cfg, model, optimizer)
+        set_seed(cfg.train.seed + rank)
+        device = resolve_device(cfg.train.device)
+        if dist_enabled and device.type == "cuda":
+            device = torch.device("cuda", local_rank)
+        dtype = resolve_dtype(cfg.train.compute_dtype)
 
-    if cfg.train.compile_model:
-        if not hasattr(torch, "compile"):
-            print("compile requested but torch.compile is not available in this PyTorch build")
-        else:
-            try:
-                model = torch.compile(model, mode=cfg.train.compile_mode)
-                print(f"torch.compile enabled (mode={cfg.train.compile_mode})")
-            except Exception as exc:
-                print(f"torch.compile failed, falling back to eager mode: {exc}")
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            torch.cuda.reset_peak_memory_stats()
 
-    train_it, val_it = build_iterators(cfg, device, tokenizer)
+        tokenizer = SwiftTokenizer.from_file(cfg.data.tokenizer_path)
+        cfg.model.vocab_size = tokenizer.get_vocab_size()
 
-    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda" and dtype == torch.float16))
-    use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+        model: torch.nn.Module = SwiftLLM(cfg.model).to(device)
+        model.set_gradient_checkpointing(bool(cfg.train.gradient_checkpointing))
+        model.set_attention_backend(cfg.train.attention_backend)
+        n_params = count_parameters(model)
+        optimizer, _, optimizer_info = build_optimizer(cfg, model, device)
 
-    logger = RunLogger(cfg.train.run_name, cfg.train.checkpoint_dir)
-    run_start = time.time()
+        step, best_val_bpb = restore_training_state(cfg, model, optimizer)
 
-    core_tokenizer = GPT2TokenizerCompat(tiktoken.get_encoding("gpt2"))
-    token_bytes = tokenizer.build_token_bytes().to(device)
+        if cfg.train.compile_model:
+            if not hasattr(torch, "compile"):
+                main_print("compile requested but torch.compile is not available in this PyTorch build")
+            else:
+                try:
+                    model = torch.compile(model, mode=cfg.train.compile_mode)
+                    main_print(f"torch.compile enabled (mode={cfg.train.compile_mode})")
+                except Exception as exc:
+                    main_print(f"torch.compile failed, falling back to eager mode: {exc}")
 
-    last_core = None
-    last_val_bpb = None
+        if dist_enabled:
+            if device.type == "cuda":
+                model = DDP(
+                    model,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=cfg.train.ddp_find_unused_parameters,
+                )
+            else:
+                model = DDP(model, find_unused_parameters=cfg.train.ddp_find_unused_parameters)
 
-    print("=" * 88)
-    print(f"Run: {cfg.train.run_name}")
-    print(f"Device: {device}")
-    print(f"Compute dtype: {cfg.train.compute_dtype}")
-    print(f"Parameters: {n_params:,} ({format_params(n_params)})")
-    print(f"Tokenizer: {cfg.data.tokenizer_path} (vocab={cfg.model.vocab_size})")
-    print(f"Token cache dir: {cfg.data.token_cache_dir or '(disabled)'}")
-    print(f"Conditional memory: {cfg.model.use_conditional_memory}")
-    print(f"Gradient checkpointing: {cfg.train.gradient_checkpointing}")
-    print(f"Attention backend: {cfg.train.attention_backend}")
-    print(f"Compile model: {cfg.train.compile_model} ({cfg.train.compile_mode})")
-    print(f"Optimizer: {cfg.train.optimizer}")
-    print(optimizer_info)
-    print(f"Checkpoint dir: {cfg.train.checkpoint_dir}")
-    print(
-        f"Targets: val_bpb<={cfg.targets.target_val_bpb}, CORE>={cfg.targets.target_core}, "
-        f"time<={cfg.targets.target_hours}h"
-    )
-    print("=" * 88)
+        train_it, val_it = build_iterators(cfg, device, tokenizer, rank=rank, world_size=world_size)
 
-    t_log_window = time.time()
-    running_loss = 0.0
-    step_time_ms_accum = 0.0
+        scaler = torch.amp.GradScaler(enabled=(device.type == "cuda" and dtype == torch.float16))
+        use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
-    while step < cfg.train.num_steps:
-        t_step0 = time.time()
-        optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+        logger: RunLogger | None = RunLogger(cfg.train.run_name, cfg.train.checkpoint_dir) if is_main else None
+        run_start = time.time()
 
-        lr = cosine_lr(step, cfg)
-        if isinstance(optimizer, CombinedOptimizer):
-            optimizer.set_lrs({"adamw": lr, "muon": lr})
-        else:
-            for group in optimizer.param_groups:
-                group["lr"] = lr
+        core_tokenizer = GPT2TokenizerCompat(tiktoken.get_encoding("gpt2"))
+        token_bytes = tokenizer.build_token_bytes().to(device)
 
-        for _ in range(cfg.train.grad_accum_steps):
-            x, y = next(train_it)
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
-                loss = model(x, y)
-                loss = loss / cfg.train.grad_accum_steps
+        last_core = None
+        last_val_bpb = None
+
+        main_print("=" * 88)
+        main_print(f"Run: {cfg.train.run_name}")
+        main_print(f"Device: {device}")
+        main_print(f"Distributed: {dist_enabled} (rank={rank}, world_size={world_size}, local_rank={local_rank})")
+        main_print(f"Compute dtype: {cfg.train.compute_dtype}")
+        main_print(f"Parameters: {n_params:,} ({format_params(n_params)})")
+        main_print(f"Tokenizer: {cfg.data.tokenizer_path} (vocab={cfg.model.vocab_size})")
+        main_print(f"Token cache dir: {cfg.data.token_cache_dir or '(disabled)'}")
+        main_print(f"Conditional memory: {cfg.model.use_conditional_memory}")
+        main_print(f"Gradient checkpointing: {cfg.train.gradient_checkpointing}")
+        main_print(f"Attention backend: {cfg.train.attention_backend}")
+        main_print(f"Compile model: {cfg.train.compile_model} ({cfg.train.compile_mode})")
+        main_print(f"Optimizer: {cfg.train.optimizer}")
+        main_print(optimizer_info)
+        main_print(f"Checkpoint dir: {cfg.train.checkpoint_dir}")
+        main_print(
+            f"Targets: val_bpb<={cfg.targets.target_val_bpb}, CORE>={cfg.targets.target_core}, "
+            f"time<={cfg.targets.target_hours}h"
+        )
+        main_print("=" * 88)
+
+        t_log_window = time.time()
+        running_loss = 0.0
+        step_time_ms_accum = 0.0
+
+        while step < cfg.train.num_steps:
+            t_step0 = time.time()
+            optimizer.zero_grad(set_to_none=True)
+            loss_accum = 0.0
+
+            lr = cosine_lr(step, cfg)
+            if isinstance(optimizer, CombinedOptimizer):
+                optimizer.set_lrs({"adamw": lr, "muon": lr})
+            else:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+
+            for _ in range(cfg.train.grad_accum_steps):
+                x, y = next(train_it)
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
+                    loss = model(x, y)
+                    loss = loss / cfg.train.grad_accum_steps
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                loss_accum += loss.item()
 
             if scaler.is_enabled():
-                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                optimizer.step()
 
-            loss_accum += loss.item()
+            running_loss += loss_accum
+            step += 1
+            step_ms = (time.time() - t_step0) * 1000.0
+            step_time_ms_accum += step_ms
 
-        if scaler.is_enabled():
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-            optimizer.step()
-
-        running_loss += loss_accum
-        step += 1
-        step_ms = (time.time() - t_step0) * 1000.0
-        step_time_ms_accum += step_ms
-
-        if step % cfg.train.log_every == 0:
-            elapsed = time.time() - t_log_window
-            avg_loss = running_loss / cfg.train.log_every
-            tokens = (
-                cfg.train.micro_batch_size
-                * cfg.train.max_seq_len
-                * cfg.train.grad_accum_steps
-                * cfg.train.log_every
-            )
-            tok_per_sec = tokens / max(elapsed, 1e-6)
-            elapsed_hours = estimate_elapsed_hours(run_start)
-            avg_step_ms = step_time_ms_accum / cfg.train.log_every
-
-            peak_vram_gb = None
-            if device.type == "cuda":
-                peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-
-            progress = target_progress_text(
-                val_bpb=last_val_bpb,
-                core=last_core,
-                elapsed_hours=elapsed_hours,
-                target_val_bpb=cfg.targets.target_val_bpb,
-                target_core=cfg.targets.target_core,
-                target_hours=cfg.targets.target_hours,
-            )
-
-            print(
-                f"step={step:6d} lr={lr:.3e} train_loss={avg_loss:.4f} tok_per_sec={tok_per_sec:,.0f} "
-                f"step_ms={avg_step_ms:.1f} elapsed={elapsed_hours:.2f}h"
-            )
-            print(progress)
-
-            logger.log(
-                ThroughputStats(
-                    step=step,
-                    lr=lr,
-                    train_loss=avg_loss,
-                    val_bpb=last_val_bpb,
-                    core_metric=last_core,
-                    tok_per_sec=tok_per_sec,
-                    step_ms=avg_step_ms,
-                    elapsed_hours=elapsed_hours,
-                    peak_vram_gb=peak_vram_gb,
+            if step % cfg.train.log_every == 0:
+                elapsed = time.time() - t_log_window
+                avg_loss = running_loss / cfg.train.log_every
+                tokens = (
+                    cfg.train.micro_batch_size
+                    * cfg.train.max_seq_len
+                    * cfg.train.grad_accum_steps
+                    * cfg.train.log_every
                 )
-            )
+                tok_per_sec = tokens / max(elapsed, 1e-6)
+                elapsed_hours = estimate_elapsed_hours(run_start)
+                avg_step_ms = step_time_ms_accum / cfg.train.log_every
 
-            running_loss = 0.0
-            step_time_ms_accum = 0.0
-            t_log_window = time.time()
+                peak_vram_gb = None
+                if device.type == "cuda":
+                    peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-        if cfg.train.eval_every > 0 and step % cfg.train.eval_every == 0:
-            val_bpb = evaluate_bpb(
-                model=model,
-                batch_iter=val_it,
-                eval_batches=cfg.train.eval_batches,
-                token_bytes=token_bytes,
-                autocast_dtype=dtype,
-                use_amp=use_amp,
-            )
-            last_val_bpb = val_bpb
-            print(f"step={step:6d} val_bpb={val_bpb:.5f}")
-            best_val_bpb = min(best_val_bpb, val_bpb)
+                progress = target_progress_text(
+                    val_bpb=last_val_bpb,
+                    core=last_core,
+                    elapsed_hours=elapsed_hours,
+                    target_val_bpb=cfg.targets.target_val_bpb,
+                    target_core=cfg.targets.target_core,
+                    target_hours=cfg.targets.target_hours,
+                )
 
-        if (
-            cfg.benchmark.enable_core_eval
-            and cfg.benchmark.core_every > 0
-            and step % cfg.benchmark.core_every == 0
-        ):
-            model.eval()
-            core_out = evaluate_core(
-                model=model,
-                tokenizer=core_tokenizer,
-                work_dir=Path(cfg.train.checkpoint_dir),
-                device=device,
-                max_per_task=cfg.benchmark.core_max_per_task,
-                bundle_path=cfg.benchmark.core_bundle_path,
-            )
-            model.train()
-            last_core = float(core_out["core_metric"])
-            print(f"step={step:6d} core_metric={last_core:.4f}")
+                if is_main:
+                    print(
+                        f"step={step:6d} lr={lr:.3e} train_loss={avg_loss:.4f} tok_per_sec={tok_per_sec:,.0f} "
+                        f"step_ms={avg_step_ms:.1f} elapsed={elapsed_hours:.2f}h"
+                    )
+                    print(progress)
 
-        if cfg.train.save_every > 0 and step % cfg.train.save_every == 0:
-            ckpt_path = Path(cfg.train.checkpoint_dir) / f"step_{step:06d}.pt"
+                    if logger is not None:
+                        logger.log(
+                            ThroughputStats(
+                                step=step,
+                                lr=lr,
+                                train_loss=avg_loss,
+                                val_bpb=last_val_bpb,
+                                core_metric=last_core,
+                                tok_per_sec=tok_per_sec,
+                                step_ms=avg_step_ms,
+                                elapsed_hours=elapsed_hours,
+                                peak_vram_gb=peak_vram_gb,
+                            )
+                        )
+
+                running_loss = 0.0
+                step_time_ms_accum = 0.0
+                t_log_window = time.time()
+
+            if cfg.train.eval_every > 0 and step % cfg.train.eval_every == 0:
+                val_bpb = evaluate_bpb(
+                    model=model,
+                    batch_iter=val_it,
+                    eval_batches=cfg.train.eval_batches,
+                    token_bytes=token_bytes,
+                    autocast_dtype=dtype,
+                    use_amp=use_amp,
+                )
+                last_val_bpb = val_bpb
+                if is_main:
+                    print(f"step={step:6d} val_bpb={val_bpb:.5f}")
+                best_val_bpb = min(best_val_bpb, val_bpb)
+
+            if (
+                cfg.benchmark.enable_core_eval
+                and cfg.benchmark.core_every > 0
+                and step % cfg.benchmark.core_every == 0
+            ):
+                if dist_enabled:
+                    barrier()
+                if is_main:
+                    core_model = model.module if isinstance(model, DDP) else model
+                    core_model.eval()
+                    core_out = evaluate_core(
+                        model=core_model,
+                        tokenizer=core_tokenizer,
+                        work_dir=Path(cfg.train.checkpoint_dir),
+                        device=device,
+                        max_per_task=cfg.benchmark.core_max_per_task,
+                        bundle_path=cfg.benchmark.core_bundle_path,
+                    )
+                    core_model.train()
+                    last_core = float(core_out["core_metric"])
+                    print(f"step={step:6d} core_metric={last_core:.4f}")
+                if dist_enabled:
+                    barrier()
+
+            if cfg.train.save_every > 0 and step % cfg.train.save_every == 0:
+                if dist_enabled:
+                    barrier()
+                if is_main:
+                    ckpt_path = Path(cfg.train.checkpoint_dir) / f"step_{step:06d}.pt"
+                    save_checkpoint(
+                        path=ckpt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        state=CheckpointState(step=step, best_val_loss=best_val_bpb),
+                    )
+                    print(f"saved checkpoint: {ckpt_path}")
+                if dist_enabled:
+                    barrier()
+
+        if dist_enabled:
+            barrier()
+        if is_main:
+            final_ckpt = Path(cfg.train.checkpoint_dir) / f"step_{step:06d}.pt"
             save_checkpoint(
-                path=ckpt_path,
+                path=final_ckpt,
                 model=model,
                 optimizer=optimizer,
                 state=CheckpointState(step=step, best_val_loss=best_val_bpb),
             )
-            print(f"saved checkpoint: {ckpt_path}")
-
-    final_ckpt = Path(cfg.train.checkpoint_dir) / f"step_{step:06d}.pt"
-    save_checkpoint(
-        path=final_ckpt,
-        model=model,
-        optimizer=optimizer,
-        state=CheckpointState(step=step, best_val_loss=best_val_bpb),
-    )
-    print(f"training completed. final checkpoint: {final_ckpt}")
+            print(f"training completed. final checkpoint: {final_ckpt}")
+        if dist_enabled:
+            barrier()
+    finally:
+        cleanup_distributed()

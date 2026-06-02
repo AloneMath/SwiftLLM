@@ -80,6 +80,10 @@ class TrainConfig:
     compile_model: bool = False
     compile_mode: str = "default"
     gradient_checkpointing: bool = False
+    distributed: bool = False
+    dist_backend: str = "nccl"
+    ddp_find_unused_parameters: bool = False
+    dist_timeout_sec: int = 1800
     checkpoint_dir: str = "./checkpoints/swiftllm_300m"
 
 
