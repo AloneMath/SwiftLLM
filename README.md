@@ -174,3 +174,8 @@ python -m scripts.chat_eval \
 ## Notes
 
 - If you want real pass@k later, extend the HumanEval harness with multiple samples.
+
+## Acknowledgements
+
+- Reference repository: [karpathy/nanochat](https://github.com/karpathy/nanochat)
+- Thanks to Andrej Karpathy for his education efforts and open-source work: [https://github.com/karpathy](https://github.com/karpathy)
