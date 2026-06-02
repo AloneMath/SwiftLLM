@@ -1,0 +1,52 @@
+data:
+  data_dir: D:/S/S/base_data
+  tokenizer_path: ./artifacts/tokenizer
+  shard_prefix: shard_
+  train_shards: 1
+  val_shard_index: 8
+  text_column: text
+
+model:
+  vocab_size: 50257
+  n_layers: 4
+  n_heads: 8
+  n_kv_heads: 8
+  d_model: 512
+  d_ff: 1536
+  max_seq_len: 256
+  rope_theta: 10000.0
+  dropout: 0.0
+  use_conditional_memory: false
+  memory_slots: 32
+  memory_k: 4
+
+train:
+  run_name: swiftllm_quick_5min_run
+  device: cuda
+  seed: 42
+  compute_dtype: float16
+  num_steps: 2500
+  lr: 0.0005
+  min_lr: 0.00005
+  warmup_steps: 50
+  weight_decay: 0.05
+  grad_clip: 1.0
+  micro_batch_size: 1
+  grad_accum_steps: 1
+  max_seq_len: 256
+  eval_every: -1
+  eval_batches: 0
+  log_every: 20
+  save_every: -1
+  checkpoint_dir: ./checkpoints/swiftllm_quick_5min_run
+
+targets:
+  target_val_bpb: 0.7180
+  target_core: 0.2565
+  target_hours: 1.65
+
+benchmark:
+  enable_core_eval: false
+  core_every: 5000
+  core_max_per_task: 10
+  core_bundle_path: ""

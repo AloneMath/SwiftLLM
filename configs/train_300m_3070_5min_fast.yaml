@@ -1,0 +1,56 @@
+data:
+  data_dir: D:/S/S/base_data
+  tokenizer_path: ./artifacts/tokenizer
+  shard_prefix: shard_
+  train_shards: 8
+  val_shard_index: 8
+  text_column: text
+  token_cache_dir: ./artifacts/token_cache_8shards
+
+model:
+  vocab_size: 50257
+  n_layers: 20
+  n_heads: 16
+  n_kv_heads: 16
+  d_model: 1024
+  d_ff: 2688
+  max_seq_len: 1024
+  rope_theta: 10000.0
+  dropout: 0.0
+  use_conditional_memory: false
+  memory_slots: 64
+  memory_k: 4
+
+train:
+  run_name: swiftllm_300m_3070_5min_fast
+  device: cuda
+  seed: 42
+  compute_dtype: float16
+  num_steps: 11
+  lr: 0.0003
+  min_lr: 0.00003
+  warmup_steps: 2
+  weight_decay: 0.1
+  grad_clip: 1.0
+  micro_batch_size: 1
+  grad_accum_steps: 16
+  max_seq_len: 1024
+  eval_every: -1
+  eval_batches: 0
+  log_every: 1
+  save_every: -1
+  compile_model: false
+  compile_mode: default
+  gradient_checkpointing: true
+  checkpoint_dir: ./checkpoints/swiftllm_300m_3070_5min_fast
+
+targets:
+  target_val_bpb: 0.7180
+  target_core: 0.2565
+  target_hours: 1.65
+
+benchmark:
+  enable_core_eval: false
+  core_every: 5000
+  core_max_per_task: 100
+  core_bundle_path: ""
