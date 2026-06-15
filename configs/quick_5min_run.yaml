@@ -1,5 +1,5 @@
 data:
-  data_dir: D:/S/S/base_data
+  data_dir: ./base_data
   tokenizer_path: ./artifacts/tokenizer
   shard_prefix: shard_
   train_shards: 1

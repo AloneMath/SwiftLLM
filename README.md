@@ -79,6 +79,12 @@ python -m scripts.train --config .\configs\train_300m_3070.yaml
 python -m scripts.train --config .\configs\train_300m_3070_fast.yaml
 ```
 
+### 3b-1) Base pretrain (A800 fast preset: flash attention + compile + token cache)
+
+```powershell
+python -m scripts.train --config .\configs\train_300m_a800_fast.yaml
+```
+
 ### 3c) Build token cache (optional, speeds up training input pipeline)
 
 ```powershell

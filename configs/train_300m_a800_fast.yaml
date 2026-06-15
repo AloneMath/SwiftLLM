@@ -22,27 +22,32 @@ model:
   memory_k: 4
 
 train:
-  run_name: swiftllm_300m_3070_5min_speed
+  run_name: swiftllm_300m_a800_fast
   device: cuda
   seed: 42
-  compute_dtype: float16
-  num_steps: 11
+  compute_dtype: bfloat16
+  num_steps: 30000
   lr: 0.0003
   min_lr: 0.00003
-  warmup_steps: 2
+  warmup_steps: 500
   weight_decay: 0.1
+  optimizer: adamw
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  attention_backend: flash
   grad_clip: 1.0
-  micro_batch_size: 1
-  grad_accum_steps: 16
+  micro_batch_size: 8
+  grad_accum_steps: 2
   max_seq_len: 1024
-  eval_every: -1
-  eval_batches: 0
-  log_every: 1
-  save_every: -1
-  compile_model: false
+  eval_every: 1000
+  eval_batches: 16
+  log_every: 20
+  save_every: 1000
+  compile_model: true
   compile_mode: default
   gradient_checkpointing: false
-  checkpoint_dir: ./checkpoints/swiftllm_300m_3070_5min_speed
+  distributed: false
+  checkpoint_dir: ./checkpoints/swiftllm_300m_a800_fast
 
 targets:
   target_val_bpb: 0.7180
